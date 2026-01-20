@@ -18,45 +18,138 @@ Optional downstream:
 - EMBOSS `cons`
 - SubFam
 
-## Quick start
+# SINEBase fragment query builder (sanitize → shred → LC filter → nr85)
 
-### A) Provide a full SINE DB (it will be fragmented)
-```bash
-bash bin/sine_scan.sh genome.fa sine_db.fa out
-```bash
+This repo builds a robust, search-ready fragment query set from a SINE database FASTA.
 
-### B) Provide pre-fragmented queries
-```bash
-bash bin/sine_scan.sh genome.fa fragments.fa out --fragments
-```bash
+It produces:
+- `*.fragments.norm.fa`  (shredded fragments with normalized coordinate headers)
+- `*.fragments.lc.fa`    (low-complexity filtered fragments)
+- `*.fragments.nr85.fa`  (nonredundant fragments clustered at 85% identity)
+
+Designed to be “safe by default” for downstream tools (including EMBOSS `cons`), while keeping
+the workflow simple and reproducible.
+
 ---
 
-### Minimal “workflow” summary (what it does, in one paragraph)
-- Build `.fai`, fragment DB (or use provided fragments), search each fragment against genome chunks with `ssearch36`, filter by identity+coverage, convert chunk-relative coords to genome coords, merge on strand into anchor loci, extract anchors, then expand and re-extract longer candidates, and finally sanitize headers for `cons/SubFam`.
+## Requirements
 
-Key outputs
+**Core**
+- bash
+- awk
+- seqkit
+- bedtools
+- vsearch
 
-out/merged_loci.bed and out/merged_loci.fa
-Anchor loci (small context; default FLANK=50)
+(plus standard utils: `gzip`, `mktemp`)
 
-out/merged_loci.big.bed and out/merged_loci.big.fa
-Candidate loci (expanded context; default BIGFLANK=500)
+---
 
-out/merged_loci.big.safe.fa
-Same candidates with safe headers for cons/SubFam
+## Pipeline overview
 
-Tuning (env vars)
-CHUNK_BP=100000000   # genome chunk size
-MIN_ID=65            # percent identity threshold
-MIN_COV=0.90         # aligned_len / query_len threshold
+### Script 1 — sanitize + shred
+`01_sanitize_shred.sh`
 
-FLANK=50             # context around raw hits for anchor merge
-BIGFLANK=500         # context around anchors for candidate sequences
+Input:
+- SINE DB FASTA (e.g. `SINEBase.nr95.fa`)
 
-FRAG_LEN=50          # fragment length when fragmenting DB
-FRAG_STEP=25         # step size when fragmenting DB
+Does:
+1) Normalize sequences: uppercase + one-line (`seqkit seq -u -w 0`)
+2) Sanitize FASTA **ID token only**: replaces `|` and `:` with `_`
+3) Enforce unique IDs by appending `_<record_number>`
+4) Shred each record into regions:
+   - **5′**: 1–150 bp (sliding step 10)
+   - **mid**: 151..(L-100) if L>250 (sliding step 25)
+   - **3′**: last 99 bp if L>150 (sliding step 25)
+5) Sliding window fragments (default `FRAGLEN=50`)
+6) Normalize fragment headers to embed true coordinates within the original SINE record:
 
+Header format:
+```
+>SEQID|REGION:START-END
+```
 
-Example:
+Output:
+- `<prefix>.fragments.norm.fa`
 
-BIGFLANK=1000 MIN_COV=0.85 bash bin/sine_scan.sh genome.fa sine_db.fa out
+Run:
+```bash
+bash 01_sanitize_shred.sh SINEBase.nr95.fa SINEBase.nr95
+```
+
+---
+
+### Script 2 — low-complexity filter + nr85 clustering
+`02_filter_lc_cluster_nr85.sh`
+
+Input:
+- `<prefix>.fragments.norm.fa`
+
+Does:
+1) Filters obvious low-complexity fragments:
+   - homopolymers >15 bp
+   - dinucleotide repeats >15 bp (>=8 repeats)
+   - trinucleotide repeats >15 bp (>=6 repeats; excluding AAA/TTT/GGG/CCC)
+2) Writes a log with per-fragment reasons and counts:
+   - `<prefix>.lowcomplexity.log`
+3) Clusters passing fragments at 85% identity (centroids only):
+   - `vsearch --cluster_fast ... --id 0.85 --strand both`
+
+Outputs:
+- `<prefix>.fragments.lc.fa`
+- `<prefix>.fragments.nr85.fa`
+
+Run:
+```bash
+bash 02_filter_lc_cluster_nr85.sh SINEBase.nr95.fragments.norm.fa 8
+```
+
+---
+
+## Typical usage (end-to-end)
+
+```bash
+bash 01_sanitize_shred.sh SINEBase.nr95.fa SINEBase.nr95
+bash 02_filter_lc_cluster_nr85.sh SINEBase.nr95.fragments.norm.fa 8
+```
+
+Your final query set for genome searching:
+- `SINEBase.nr95.fragments.nr85.fa`
+
+---
+
+## Notes / rationale
+
+- **Uniqueness**: IDs are forced unique early (`_<record_number>`) to avoid collisions during downstream parsing.
+- **Sanitization**: only the ID token is sanitized (replacing `|` and `:`), because those are common troublemakers
+  (e.g., EMBOSS `cons` failing on `|`, and `:` colliding with coordinate parsing). Descriptions after whitespace
+  are dropped (current behavior), consistent with many FASTA-processing tools.
+- **Fragment header coordinates** are designed to support later clustering/diagnostics and to make it obvious which
+  region of the original SINE produced the fragment.
+
+---
+
+## Output files (summary)
+
+For input prefix `SINEBase.nr95`:
+
+- `SINEBase.nr95.fragments.norm.fa`  
+  All fragments (normalized coordinates in headers)
+
+- `SINEBase.nr95.fragments.lc.fa`  
+  Low-complexity filtered fragments
+
+- `SINEBase.nr95.fragments.nr85.fa`  
+  Nonredundant fragments (centroids at 85% identity)
+
+- `SINEBase.nr95.lowcomplexity.log`  
+  Filtering report (IDs + reasons + counts)
+
+---
+
+## Next step: genome search
+
+These scripts only build the query set. Use your genome scanning workflow
+(e.g., `ssearch36` chunk scanning + merge + BIGFLANK extraction) with:
+
+`<prefix>.fragments.nr85.fa`
