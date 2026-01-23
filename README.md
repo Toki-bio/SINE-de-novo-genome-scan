@@ -36,10 +36,9 @@ Command:
 
 bash 01_sanitize_shred.sh SINEBase.nr95.fa SINEBase.nr95
 
-
 What the script actually does (from code):
 
-Sanitizes FASTA IDs, keeps only the first whitespace-delimited token, replaces | and : with _ (required for EMBOSS / downstream parsers), appends _<record_number> to guarantee uniqueness, uppercase, single-line FASTA.
+Sanitizes FASTA IDs, keeps only the first whitespace-delimited token, replaces | and : with _ (required for EMBOSS / downstream parsers), appends _<record_number> to guarantee uniqueness, uppercase, s[...]\n
 
 Splits each SINE of length L into regions:
 
@@ -97,84 +96,63 @@ bash 02_filter_lc_cluster_nr85.sh SINEBase.nr95.fragments.norm.fa 8
 
 ---
 
-Stage 2 — Genome scanning
+### STAGE 2 — Genome scanning
+
 ### Script 3: sine_scan.sh
 
 Purpose:
 Search a genome for SINE-like loci using the fragment query set.
 
 Input:
-Genome FASTA
+- Genome FASTA
+- Fragment query FASTA (`*.fragments.nr85.fa`)
 
-Fragment query FASTA (*.fragments.nr85.fa)
+What the script does:
+1. Optional genome subsampling
+   - By fraction (e.g. 5% of genome)
+   - Or by fixed bp count
+   - Uses random scaffold selection (not positional bias)
+2. Per-fragment Smith–Waterman search
+   - Tool: `ssearch36`
+   - Parallelized at the query level
+   - Each fragment is searched independently
+   - Live progress reporting: `[QUERY 412/926] src=5S-Sauria region=5p 11–60 raw=42 filtered=3`
+3. Filtering
+   - Minimum identity
+   - Minimum query coverage
+4. Hit merging
+   - All filtered hits merged into a single file
+   - Converted to BED
+5. Candidate locus clustering
+   - Genomic hits merged within 500 bp
+   - Produces candidate SINE loci
+6. Sequence extraction
+   - Flanks added
+   - FASTA extracted for downstream validation
 
-Command (example):
+Outputs:
+- `query_summary.tsv` (per-fragment statistics)
+- `all_hits.filtered.m8` (merged filtered hits)
+- `candidate_loci.bed` (clustered loci)
+- `candidates.fa` (extracted sequences)
 
+Run:
+```bash
 bash sine_scan.sh \
   -q SINEBase.nr95.fragments.nr85.fa \
   -g genome.fa \
   -o sine_search_out/genome_name
+```
 
+---
 
-What the script does:
+### File provenance summary (important)
 
-Optional genome subsampling
-
-By fraction (e.g. 5% of genome)
-
-Or by fixed bp count
-
-Uses random scaffold selection (not positional bias)
-
-Per-fragment Smith–Waterman search
-
-Tool: ssearch36
-
-Parallelized at the query level
-
-Each fragment is searched independently
-
-Live progress reporting:
-
-[QUERY 412/926] src=5S-Sauria region=5p 11–60 raw=42 filtered=3
-
-
-Filtering
-
-Minimum identity
-
-Minimum query coverage
-
-Hit merging
-
-All filtered hits merged into a single file
-
-Converted to BED
-
-Candidate locus clustering
-
-Genomic hits merged within 500 bp
-
-Produces candidate SINE loci
-
-Sequence extraction
-
-Flanks added
-
-FASTA extracted for downstream validation
-
-Key outputs:
-
-query_summary.tsv          # per-fragment statistics
-all_hits.filtered.m8       # merged filtered hits
-candidate_loci.bed         # clustered loci
-candidates.fa              # extracted sequences
-
-File provenance summary (important)
-File	Produced by	Command
-*.fragments.norm.fa	01_sanitize_shred.sh	bash 01_sanitize_shred.sh …
-*.fragments.lc.fa	02_filter_lc_cluster_nr85.sh	same
-*.fragments.nr85.fa	02_filter_lc_cluster_nr85.sh	same
-query_summary.tsv	sine_scan.sh	genome scan
-candidate_loci.bed	sine_scan.sh	genome scan
-candidates.fa	sine_scan.sh	genome scan
+| File | Produced by | Command |
+| :--- | :--- | :--- |
+| `*.fragments.norm.fa` | `01_sanitize_shred.sh` | `bash 01_sanitize_shred.sh ...` |
+| `*.fragments.lc.fa` | `02_filter_lc_cluster_nr85.sh` | same |
+| `*.fragments.nr85.fa` | `02_filter_lc_cluster_nr85.sh` | same |
+| `query_summary.tsv` | `sine_scan.sh` | genome scan |
+| `candidate_loci.bed` | `sine_scan.sh` | genome scan |
+| `candidates.fa` | `sine_scan.sh` | genome scan |
