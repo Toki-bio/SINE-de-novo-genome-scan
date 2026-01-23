@@ -1,42 +1,29 @@
-SINE Fragment Scanner
+# SINE-de-novo-genome-scan
+Perform a de novo genome search for SINEs using a database of known SINE sequences.
+Finding a SINE in a genome can be done with searching for even a faint similarity to already known SINE sequnces, because many of them share at least a limited similarity.
 
-Fragment-based genome scanning pipeline for discovery of SINE elements
+This workflow does the following:
+1) fragmenting a SINE database of consensus sequences from various genomes into short windows (default 50 bp, 25 bp step),
+2) searching each fragment against the studied genome with `ssearch36`,
+3) merging hits into anchor loci,
+4) expanding anchors to full candidate sequences,
+5) prepares sequences for downstream analysis using SubFam or targeted subfamily analysis.
 
-This repository contains a two-stage, fully reproducible pipeline:
+## Requirements
+- samtools
+- bedtools
+- FASTA36 (ssearch36)
+- awk, sort, wc, bash
 
-Build a high-quality fragment query set from a SINE database
+Initial SINE database can be obtained from various sources
+SINEbase https://sines.eimb.ru/
+Manuscripts  on SINE analysis with consensus sequences
+Repeats annotation databases filtered for consistency and verified 
 
-Scan genomes with those fragments using sensitive Smith–Waterman searches
+### DATABASE PREPARATION
+Input SINEs.fa file is deduplicated using vsearch with 95% similarity cutoff 
 
-All files produced by the pipeline can be traced back to a specific script and command.
-
-Overview of the workflow
-SINE database FASTA
-        │
-        ▼
-01_sanitize_shred.sh
-        │
-        └──► *.fragments.norm.fa
-                │
-                ▼
-02_filter_lc_cluster_nr85.sh
-                │
-                ├──► *.fragments.lc.fa
-                └──► *.fragments.nr85.fa   ← FINAL QUERY SET
-                                │
-                                ▼
-sine_scan.sh
-                                │
-                                ├──► per-query search logs
-                                ├──► merged hits
-                                ├──► clustered loci (BED)
-                                └──► extracted candidate SINE sequences (FASTA)
-
-Stage 1 — Build fragment query set
-
-This stage turns a heterogeneous SINE database into fixed-length, non-redundant, low-complexity-filtered fragments suitable for large-scale genome searches.
-
-Script 1: 01_sanitize_shred.sh
+### Script 1: 01_sanitize_shred.sh
 
 Purpose:
 Normalize SINE sequences, enforce safe/unique FASTA IDs, and shred each SINE into biologically meaningful fragments with explicit coordinates.
@@ -52,127 +39,71 @@ bash 01_sanitize_shred.sh SINEBase.nr95.fa SINEBase.nr95
 
 What the script actually does (from code):
 
-Sanitizes FASTA IDs
+Sanitizes FASTA IDs, keeps only the first whitespace-delimited token, replaces | and : with _ (required for EMBOSS / downstream parsers), appends _<record_number> to guarantee uniqueness, uppercase, single-line FASTA.
 
-Keeps only the first whitespace-delimited token
+Splits each SINE of length L into regions:
 
-Replaces | and : with _ (required for EMBOSS / downstream parsers)
-
-Appends _<record_number> to guarantee uniqueness
-
-Normalizes sequences
-
-Uppercase
-
-Single-line FASTA (seqkit seq -u -w 0)
-
-Splits each SINE into regions
-
-5′ region: bases 1–150
-
-Middle region: bases 151–(L−100) if L > 250
-
-3′ region: last 99 bp if L > 150
-
-Sliding-window fragmentation
-
-Fragment length: 50 bp
-
-Step size:
-
-5′ region: 10 bp
-
-middle / 3′: 25 bp
-
-Normalizes fragment headers
-Each fragment header encodes:
-
-source SINE ID
-
-region (5p, mid, 3p)
-
-true coordinates within the original SINE
+ 5′ region: bases 1–150 with 10bp step
+ middle region: bases 151–(L−100) if L>250 with 25bp step
+ 3′ region: last 99 bp if L>150  with 25bp step
 
 Header format:
-
 >SINE_ID|REGION:START-END
+source SINE ID
+region (5p, mid, 3p)
+true coordinates within the original SINE
 
-
-Output (important):
-
+Output:
 SINEBase.nr95.fragments.norm.fa
 
+This file contains all fragments, including low-complexity and redundant ones. It is not intended for genome searching yet (needs deduplication).
 
-This file contains all fragments, including low-complexity and redundant ones.
-It is not intended for genome searching yet.
+Header format:
+```
+>SEQID|REGION:START-END
+```
 
-Script 2: 02_filter_lc_cluster_nr85.sh
+Output:
+- `<prefix>.fragments.norm.fa`
 
-Purpose:
-Remove obvious low-complexity fragments and collapse redundancy across SINE families.
+Run:
+```bash
+bash 01_sanitize_shred.sh SINEBase.nr95.fa SINEBase.nr95
+```
 
-Input:
+---
 
-<prefix>.fragments.norm.fa
+### Script 2 — low-complexity filter + nr85 clustering
+`02_filter_lc_cluster_nr85.sh`
 
-Command:
+Does:
+1) Filters obvious low-complexity fragments:
+   - homopolymers >15 bp
+   - dinucleotide repeats >15 bp (>=8 repeats)
+   - trinucleotide repeats >15 bp (>=6 repeats; excluding AAA/TTT/GGG/CCC)
+2) Writes a log with per-fragment reasons and counts:
+   - `<prefix>.lowcomplexity.log`
+3) Clusters passing fragments at 85% identity (centroids only):
+   - `vsearch --cluster_fast ... --id 0.85 --strand both`
 
+Outputs:
+- `<prefix>.fragments.lc.fa`
+- `<prefix>.fragments.nr85.fa`
+
+Run:
+```bash
 bash 02_filter_lc_cluster_nr85.sh SINEBase.nr95.fragments.norm.fa 8
+```
 
-
-(8 = number of threads for vsearch)
-
-What the script actually does:
-
-1. Low-complexity filtering (explicit rules)
-
-Fragments are removed if they contain:
-
-Homopolymers >15 bp
-
-Dinucleotide repeats >15 bp (≥8 repeats)
-
-Trinucleotide repeats >15 bp (≥6 repeats), excluding AAA/TTT/CCC/GGG
-
-A full log is written with fragment IDs and reasons.
-
-2. Non-redundant clustering
-
-Remaining fragments are clustered using vsearch:
-
-Identity threshold: 85%
-
-Strand: both
-
-Output: centroids only
-
-This collapses:
-
-overlapping fragments
-
-near-identical fragments from different SINE families
-
-redundant windows within the same SINE
-
-Outputs (this answers your key question):
-
-SINEBase.nr95.fragments.lc.fa     # low-complexity filtered
-SINEBase.nr95.fragments.nr85.fa   # FINAL QUERY SET
-SINEBase.nr95.lowcomplexity.log
-
-
-👉 SINEBase.fragments.nr85.fa is produced by this command and only this command.
-
-This is the file you use for genome scanning.
+---
 
 Stage 2 — Genome scanning
-Script 3: sine_scan.sh
+### Script 3: sine_scan.sh
 
 Purpose:
 Search a genome for SINE-like loci using the fragment query set.
 
 Input:
-
 Genome FASTA
 
 Fragment query FASTA (*.fragments.nr85.fa)
@@ -247,25 +178,3 @@ File	Produced by	Command
 query_summary.tsv	sine_scan.sh	genome scan
 candidate_loci.bed	sine_scan.sh	genome scan
 candidates.fa	sine_scan.sh	genome scan
-Design principles (as implemented)
-
-Fragment-level sensitivity: detect highly diverged SINEs
-
-Safe FASTA headers: compatible with EMBOSS, BEDTools, samtools
-
-Reproducible outputs: every file has a single, traceable origin
-
-No hidden heuristics: all thresholds are explicit in scripts
-
-Separation of concerns: query construction ≠ genome scanning
-
-Typical end-to-end run
-# Build fragment queries
-bash 01_sanitize_shred.sh SINEBase.nr95.fa SINEBase.nr95
-bash 02_filter_lc_cluster_nr85.sh SINEBase.nr95.fragments.norm.fa 8
-
-# Genome scan
-bash sine_scan.sh \
-  -q SINEBase.nr95.fragments.nr85.fa \
-  -g genome.fa \
-  -o sine_search_out/genome
