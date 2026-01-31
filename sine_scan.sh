@@ -115,21 +115,25 @@ if [[ "${1:-}" == "--chunk" ]]; then
           region_start=m[2]+0
         }
 
+        # Use QUERY coords for strand (correct way)
+        qs=$7+0; qe=$8+0
+        # Subject coords always ascending
         a=$9+0; b=$10+0
         a2 = region_start + a - 1
         b2 = region_start + b - 1
-
-        if(a2<b2){st=a2-1; en=b2; str="+"}
-        else     {st=b2-1; en=a2; str="-"}
+        st=a2-1; en=b2
 
         if(st<0) st=0
         if(en<=st) next
+
+        # Strand from query direction
+        strand = (qe - qs > 0) ? "+" : "-"
 
         qsafe=q
         gsub(/\|/,"_",qsafe)
         gsub(/:/,"_",qsafe)
 
-        print scf, st, en, qsafe, $3, str >> HITSFILE
+        print scf, st, en, qsafe, $3, strand >> HITSFILE
       }
     '
 
@@ -234,9 +238,10 @@ HITS_TOTAL=$(wc -l < "$CLEAN_HITS")
 Q_HIT=$(awk 'BEGIN{FS="\t"} {q[$4]=1} END{print length(q)+0}' "$CLEAN_HITS")
 log "Summary: queries_with_hits=$Q_HIT/$NQUERIES  total_hits=$HITS_TOTAL"
 
+# ONLY FIX: Add strand (column 6) to sort for proper strand-aware merging
 bedtools slop -b "$FLANK" -g "$GENOME.fai" -i "$CLEAN_HITS" \
-| sort -k1,1 -k2,2n \
-| bedtools merge -s -c 4,5 -o distinct,max \
+| sort -k1,1 -k6,6 -k2,2n | bedtools sort \
+| bedtools merge -s -c 4,5,6 -o distinct,max,distinct \
 > "$OUTDIR/merged_loci.bed"
 
 LOCI=$(wc -l < "$OUTDIR/merged_loci.bed")
