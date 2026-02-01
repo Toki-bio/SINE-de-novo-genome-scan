@@ -6,23 +6,24 @@ set +m
 # SINE FRAGMENT SEARCH (chunked DB, multi-query per chunk, PARALLELIZED)
 #
 # Usage:
-#   TARGET_GENOME=/path/to/original.genome.fa ./sine_scan.sh <search_db.fa> <queries.fa>
+#   ./sine_scan.sh <search_db.fa> <queries.fa>
 #
-# QUICK (default):
-#   - scans only chunk 1
-#   - uses only first query
-#   - limits chunk FASTA building to first MAX_DB_CONTIGS contigs from DB.fai
-#
-# FULL:
-#   FULL=1 TARGET_GENOME=... ./sine_scan.sh <search_db.fa> <queries.fa>
-#
-# Important for minus-bank:
-#   DB headers like >Scaffold_1:0-78068()
-#   The script maps hits back to original scaffold coords (Scaffold_1)
-#   so bedtools MUST use TARGET_GENOME.fai (original genome).
+# For minus-bank DB headers like:
+#   >Scaffold_8:0-77793632()
+# the script maps hits back to ORIGINAL scaffold coordinates (Scaffold_8),
+# so bedtools must use the ORIGINAL genome .fai:
+#   TARGET_GENOME=/path/to/original.genome.fa ./sine_scan.sh minus_bank.fa queries.fa
 #
 # Requires:
-#   samtools bedtools ssearch36 awk sort wc tee parallel
+#   samtools bedtools ssearch36 awk sort wc tee parallel seq
+#
+# Outputs (in OUTDIR):
+#   all_hits.bed
+#   all_hits.clean.bed
+#   all_hits.to_genome.bed
+#   merged_loci.bed
+#   merged_loci.fa
+#   merged_loci.safe.fa
 ###############################################################################
 
 ########################
@@ -32,17 +33,18 @@ CHUNK_BP="${CHUNK_BP:-100000000}"
 FLANK="${FLANK:-50}"
 MIN_ID="${MIN_ID:-65}"
 MIN_COV="${MIN_COV:-0.90}"
-MAX_CONCURRENT="${MAX_CONCURRENT:-$(nproc 2>/dev/null || echo 8)}"
 
-# QUICK defaults
-FULL="${FULL:-0}"                    # set FULL=1 for full run
-MAX_DB_CONTIGS="${MAX_DB_CONTIGS:-50}"  # only used in QUICK mode when building chunk FASTA
-STOP_AFTER_CHUNK1="${STOP_AFTER_CHUNK1:-1}"  # only used in QUICK mode
+# Do NOT default to nproc (steals the node). Cap by default.
+MAX_CONCURRENT_DEFAULT="$(nproc 2>/dev/null || echo 8)"
+if [[ "$MAX_CONCURRENT_DEFAULT" =~ ^[0-9]+$ ]] && (( MAX_CONCURRENT_DEFAULT > 8 )); then
+  MAX_CONCURRENT_DEFAULT=8
+fi
+MAX_CONCURRENT="${MAX_CONCURRENT:-$MAX_CONCURRENT_DEFAULT}"
 
 log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 
 ########################
-# --chunk mode: run exactly one chunk (called by GNU parallel)
+# --chunk mode (called by GNU parallel)
 ########################
 if [[ "${1:-}" == "--chunk" ]]; then
   chunk_i="${2:-}"
@@ -57,7 +59,6 @@ if [[ "${1:-}" == "--chunk" ]]; then
   : "${CHUNK_BP:?missing env CHUNK_BP}"
   : "${MIN_ID:?missing env MIN_ID}"
   : "${MIN_COV:?missing env MIN_COV}"
-  : "${MAX_DB_CONTIGS:?missing env MAX_DB_CONTIGS}"
 
   offset=$(( (chunk_i-1)*CHUNK_BP + 1 ))
   if (( offset > DB_SIZE )); then
@@ -76,16 +77,13 @@ if [[ "${1:-}" == "--chunk" ]]; then
   CHUNK_FASTA="$OUTDIR/chunk_${chunk_i}.fa"
   rm -f "$CHUNK_FASTA"
 
-  # Build chunk FASTA by walking the DB .fai
-  # QUICK-mode can cap how many DB contigs we pull into this chunk via MAX_DB_CONTIGS.
-  awk -v off="$offset" -v rem="$remaining" -v maxc="$MAX_DB_CONTIGS" -v do_cap="${DO_CAP_DB_CONTIGS:-0}" '
-    BEGIN{FS=OFS="\t"; c=0}
+  # Build chunk FASTA by walking DB .fai (global offset across concatenated contigs)
+  awk -v off="$offset" -v rem="$remaining" '
+    BEGIN{FS=OFS="\t"}
     {
-      if (do_cap==1 && c>=maxc) exit
       if(off>$2){off-=$2; next}
       take=$2-off+1; if(take>rem) take=rem
       print $1 ":" off "-" (off+take-1)
-      c++
       rem-=take; off=1
       if(rem<=0) exit
     }
@@ -96,9 +94,9 @@ if [[ "${1:-}" == "--chunk" ]]; then
   CHUNK_HITS="$OUTDIR/chunk_${chunk_i}.hits.bed"
   : > "$CHUNK_HITS"
 
-  # ssearch36 m8C:
-  # $1 qseqid, $2 sseqid, $3 pident, $4 length, $5 mismatch, $6 gapopen,
-  # $7 qstart, $8 qend, $9 sstart, $10 send, $11 evalue, $12 bitscore
+  # ssearch36 -m 8C columns:
+  # $1 qseqid, $2 sseqid, $3 pident, $4 length,
+  # $7 qstart, $8 qend, $9 sstart, $10 send, ...
   ssearch36 -m 8C "$QFA" "$CHUNK_FASTA" \
   | awk -v QLENFILE="$QLEN_TSV" -v MINID="$MIN_ID" -v MINCOV="$MIN_COV" -v HITSFILE="$CHUNK_HITS" '
       BEGIN{
@@ -128,13 +126,13 @@ if [[ "${1:-}" == "--chunk" ]]; then
         subj=$2
         split(subj,sa,/[ \t\r\n]+/); subj=sa[1]
 
-        # SUBJECT HEADER PARSE (minus-bank + chunk headers)
-        # Works for:
-        #   Scaffold_1:0-78068()
-        #   Scaffold_1:0-78068():18400-18449
-        #   Scaffold_8:0-77793632():1-74852821
+        # Robust split-based subject parsing (works for BOTH):
+        #   regular chunk headers:   Scaffold_1:100-200
+        #   minus-bank + chunk:      Scaffold_8:0-77793632():1-74852821
         #
-        # Split-based (NOT regex PCRE) so it actually works in awk.
+        # We always map back to ORIGINAL scaffold coords:
+        #   scf = Scaffold_8
+        #   shift = interval_start0 + chunk_off1 - 1
         n = split(subj, p, ":")
         scf = p[1]
 
@@ -154,19 +152,18 @@ if [[ "${1:-}" == "--chunk" ]]; then
           }
         }
 
-        # Subject coords within the CHUNK (1-based, ascending)
-        a=$9+0; b=$10+0
+        shift = interval_start0 + chunk_off1 - 1
 
-        # Convert to ORIGINAL scaffold BED coords (0-based half-open)
-        bed_start = interval_start0 + chunk_off1 + a - 2
-        bed_end   = interval_start0 + chunk_off1 + b - 1
+        # Subject coords inside CHUNK: allow reverse (sstart > send)
+        s1=$9+0; s2=$10+0
+        if (s1 <= s2) { ss=s1; ee=s2; strand="+" }
+        else          { ss=s2; ee=s1; strand="-" }
 
+        # Convert to ORIGINAL scaffold BED coords (0-based, half-open)
+        bed_start = shift + (ss - 1)
+        bed_end   = shift + ee
         if(bed_start < 0) bed_start = 0
         if(bed_end <= bed_start) next
-
-        # Strand from query direction
-        qs=$7+0; qe=$8+0
-        strand = (qe > qs) ? "+" : "-"
 
         qsafe=q
         gsub(/\|/,"_",qsafe)
@@ -190,31 +187,45 @@ if [[ "${1:-}" == "--chunk" ]]; then
 fi
 
 ########################
-# MAIN MODE
+# MAIN
 ########################
-[[ $# -eq 2 ]] || { echo "Usage: TARGET_GENOME=/path/to/original.genome.fa $0 <search_db.fa> <queries.fa>" >&2; exit 1; }
+[[ $# -eq 2 ]] || { echo "Usage: $0 <search_db.fa> <queries.fa>" >&2; exit 1; }
 
 SEARCH_DB="$1"
-QFA_IN="$2"
+QFA="$2"
 
-for f in "$SEARCH_DB" "$QFA_IN"; do
+for f in "$SEARCH_DB" "$QFA"; do
   [[ -f "$f" ]] || { echo "ERROR: file not found: $f" >&2; exit 1; }
 done
 
-for t in samtools bedtools ssearch36 awk sort wc tee date basename rm mkdir cat parallel seq; do
+for t in samtools bedtools ssearch36 awk sort wc tee date basename rm mkdir cat parallel seq head; do
   command -v "$t" >/dev/null || { echo "ERROR: missing $t" >&2; exit 1; }
 done
 
-TARGET_GENOME="${TARGET_GENOME:-$SEARCH_DB}"
-[[ -f "$TARGET_GENOME" ]] || { echo "ERROR: TARGET_GENOME not found: $TARGET_GENOME" >&2; exit 1; }
-
-BASE="sine_search_out/$(basename "${SEARCH_DB%.*}")"
-if (( FULL == 1 )); then
-  OUTDIR="$BASE"
-else
-  OUTDIR="${BASE}.quick"
+# Detect minus-bank by first header
+first_hdr="$(awk 'BEGIN{h=""} /^>/{print $0; exit}' "$SEARCH_DB" | sed 's/\r$//')"
+DB_IS_MINUS=0
+if [[ "$first_hdr" =~ ^\>[^:]+:[0-9]+-[0-9]+[[:space:]]*\(\)\ *$ ]] || [[ "$first_hdr" =~ ^\>[^:]+:[0-9]+-[0-9]+\(\) ]]; then
+  DB_IS_MINUS=1
 fi
 
+# Decide TARGET_GENOME
+TARGET_GENOME="${TARGET_GENOME:-$SEARCH_DB}"
+
+# If minus-bank detected but TARGET_GENOME not set (still equals DB), fail EARLY with instruction.
+if (( DB_IS_MINUS == 1 )) && [[ "$TARGET_GENOME" == "$SEARCH_DB" ]]; then
+  echo "ERROR: minus-bank style DB detected, but TARGET_GENOME is not set." >&2
+  echo "Your DB headers contain coordinate wrappers (e.g. >Scaffold_8:0-...())." >&2
+  echo "Hits are mapped to ORIGINAL scaffold names (Scaffold_8), so bedtools must use ORIGINAL genome .fai." >&2
+  echo "" >&2
+  echo "Run like this:" >&2
+  echo "  TARGET_GENOME=/path/to/original.genome.fa MAX_CONCURRENT=8 $0 $SEARCH_DB $QFA" >&2
+  exit 2
+fi
+
+[[ -f "$TARGET_GENOME" ]] || { echo "ERROR: TARGET_GENOME not found: $TARGET_GENOME" >&2; exit 1; }
+
+OUTDIR="sine_search_out/$(basename "${SEARCH_DB%.*}")"
 mkdir -p "$OUTDIR"
 LOG="$OUTDIR/run.log"
 exec > >(tee -a "$LOG") 2>&1
@@ -228,36 +239,24 @@ DB_SIZE=$(awk '{s+=$2} END{print s+0}' "$SEARCH_DB.fai")
 TOTAL_CHUNKS=$(( (DB_SIZE + CHUNK_BP - 1) / CHUNK_BP ))
 
 log "Search DB   : $SEARCH_DB"
-log "Queries FASTA: $QFA_IN"
-log "Target genome for bedtools/getfasta: $TARGET_GENOME"
+log "Queries FASTA: $QFA"
 log "Genome size : $DB_SIZE bp"
 log "Chunk size  : $CHUNK_BP bp"
 log "Total chunks: $TOTAL_CHUNKS"
 log "Parallel jobs: $MAX_CONCURRENT"
 log "MIN_ID=$MIN_ID  MIN_COV=$MIN_COV  FLANK=$FLANK"
-log "OUTDIR      : $OUTDIR"
-if (( FULL == 1 )); then
-  log "MODE        : FULL"
+if (( DB_IS_MINUS == 1 )); then
+  log "DB detected : minus-bank style headers"
 else
-  log "MODE        : QUICK (chunk1 + first query only; cap chunk build to MAX_DB_CONTIGS=$MAX_DB_CONTIGS)"
+  log "DB detected : regular FASTA headers"
 fi
-
-# QUICK: use first query only (create a tiny FASTA)
-QFA="$QFA_IN"
-if (( FULL != 1 )); then
-  QFA="$OUTDIR/queries.first1.fa"
-  awk '
-    /^>/{
-      if(seen){ exit }
-      seen=1
-    }
-    { if(seen) print }
-  ' "$QFA_IN" > "$QFA"
-  [[ -s "$QFA" ]] || { echo "ERROR: failed to extract first query from $QFA_IN" >&2; exit 2; }
-fi
+log "MAP_MODE    : ORIG"
+log "bedtools -g : $TARGET_GENOME.fai"
+log "getfasta -fi: $TARGET_GENOME"
+log "OUTDIR      : $OUTDIR"
 
 NQUERIES=$(awk '/^>/{n++} END{print n+0}' "$QFA")
-log "Queries used: $NQUERIES"
+log "Queries in FASTA: $NQUERIES"
 
 QLEN_TSV="$OUTDIR/query_lengths.tsv"
 awk '
@@ -276,7 +275,7 @@ awk '
 ALL_HITS="$OUTDIR/all_hits.bed"
 : > "$ALL_HITS"
 
-export SEARCH_DB DB_SIZE QFA QLEN_TSV OUTDIR TOTAL_CHUNKS CHUNK_BP MIN_ID MIN_COV MAX_DB_CONTIGS
+export SEARCH_DB DB_SIZE QFA QLEN_TSV OUTDIR TOTAL_CHUNKS CHUNK_BP MIN_ID MIN_COV
 
 SELF="$0"
 if command -v readlink >/dev/null 2>&1; then
@@ -286,20 +285,10 @@ else
 fi
 [[ -n "${SELF_ABS:-}" ]] && SELF="$SELF_ABS"
 
-if (( FULL == 1 )); then
-  export DO_CAP_DB_CONTIGS=0
-  log "Launching parallel processing of $TOTAL_CHUNKS chunks (-j $MAX_CONCURRENT)"
-  seq 1 "$TOTAL_CHUNKS" | parallel --eta --progress -j "$MAX_CONCURRENT" "$SELF" --chunk {}
-else
-  export DO_CAP_DB_CONTIGS=1
-  log "QUICK: running chunk 1 only (no GNU parallel fanout)"
-  "$SELF" --chunk 1
-  if (( STOP_AFTER_CHUNK1 == 1 )); then
-    : # continue to downstream steps using whatever hits we got
-  fi
-fi
+log "Launching parallel processing of $TOTAL_CHUNKS chunks (-j $MAX_CONCURRENT)"
+seq 1 "$TOTAL_CHUNKS" | parallel --eta --progress -j "$MAX_CONCURRENT" "$SELF" --chunk {}
 
-log "Collecting hits..."
+log "All chunks completed. Collecting hits..."
 cat "$OUTDIR"/chunk_*.hits.bed > "$ALL_HITS" 2>/dev/null || true
 rm -f "$OUTDIR"/chunk_*.hits.bed "$OUTDIR"/chunk_*.fa
 
@@ -309,7 +298,6 @@ if [[ ! -s "$ALL_HITS" ]]; then
 fi
 
 log "Cleaning hits..."
-
 CLEAN_HITS="$OUTDIR/all_hits.clean.bed"
 awk 'BEGIN{OFS="\t"}
      NF>=6 && $1!="" && $2~/^[0-9]+$/ && $3~/^[0-9]+$/ && $2>=0 && $3>$2 {print}
@@ -324,7 +312,7 @@ HITS_TOTAL=$(wc -l < "$CLEAN_HITS" 2>/dev/null || echo 0)
 Q_HIT=$(awk 'BEGIN{FS="\t"} {q[$4]=1} END{n=0; for(k in q)n++; print n+0}' "$CLEAN_HITS")
 log "Summary: queries_with_hits=$Q_HIT/$NQUERIES  total_hits=$HITS_TOTAL"
 
-# Safety net: normalize any composite chroms (should be 0 after fixed parser, but keep robust)
+# Safety: if any composite chrom accidentally slipped in, normalize it here.
 TO_GENOME_HITS="$OUTDIR/all_hits.to_genome.bed"
 awk 'BEGIN{OFS="\t"}
 {
@@ -362,10 +350,8 @@ log "Composite chroms remaining after normalization: $bad_left"
 
 log "Merging loci (bedtools)..."
 
-# Strand-aware merging on TARGET_GENOME coordinates
 bedtools slop -b "$FLANK" -g "$TARGET_GENOME.fai" -i "$TO_GENOME_HITS" \
-| LC_ALL=C sort -t $'\t' -k1,1 -k6,6 -k2,2n \
-| bedtools sort \
+| LC_ALL=C sort -t $'\t' -k1,1 -k2,2n -k6,6 \
 | bedtools merge -s -c 4,5,6 -o distinct,max,distinct \
 > "$OUTDIR/merged_loci.bed"
 
@@ -373,7 +359,6 @@ LOCI=$(wc -l < "$OUTDIR/merged_loci.bed" 2>/dev/null || echo 0)
 log "Summary: merged_loci=$LOCI"
 
 log "Extracting FASTA..."
-
 bedtools getfasta -fi "$TARGET_GENOME" -bed "$OUTDIR/merged_loci.bed" -s -name \
 > "$OUTDIR/merged_loci.fa"
 
@@ -385,7 +370,4 @@ log "DONE"
 log "BED   : $OUTDIR/merged_loci.bed"
 log "FASTA : $OUTDIR/merged_loci.fa"
 log "FASTA (safe): $OUTDIR/merged_loci.safe.fa"
-if (( FULL != 1 )); then
-  log "QUICK OK -> run FULL with: FULL=1 TARGET_GENOME=... $0 $SEARCH_DB $QFA_IN"
-fi
 log "==============================================="
