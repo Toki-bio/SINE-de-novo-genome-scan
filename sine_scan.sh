@@ -15,7 +15,10 @@ set +m
 #   TARGET_GENOME=/path/to/original.genome.fa ./sine_scan.sh minus_bank.fa queries.fa
 #
 # Requires:
-#   samtools bedtools ssearch36 awk sort wc tee parallel seq
+#   samtools (>= 1.10, for faidx -r) bedtools ssearch36 awk sort wc tee parallel seq
+#
+# Env: MAX_CONCURRENT (parallel chunk jobs, default <= 8), SSEARCH_THREADS (threads per
+#   ssearch36 job, default 4), TMPDIR (GNU parallel buffers; default ~/tmp, never /tmp)
 #
 # Outputs (in OUTDIR):
 #   all_hits.bed
@@ -87,9 +90,11 @@ if [[ "${1:-}" == "--chunk" ]]; then
       rem-=take; off=1
       if(rem<=0) exit
     }
-  ' "$SEARCH_DB.fai" | while read -r r; do
-      samtools faidx "$SEARCH_DB" "$r" >> "$CHUNK_FASTA"
-  done
+  ' "$SEARCH_DB.fai" > "$CHUNK_FASTA.regions"
+  # one samtools call for the whole region list: one call PER scaffold took >1 h per chunk
+  # on fragmented assemblies (saq: hundreds of thousands of scaffolds of a few hundred bp)
+  samtools faidx "$SEARCH_DB" -r "$CHUNK_FASTA.regions" > "$CHUNK_FASTA"
+  rm -f "$CHUNK_FASTA.regions"
 
   CHUNK_HITS="$OUTDIR/chunk_${chunk_i}.hits.bed"
   : > "$CHUNK_HITS"
@@ -97,7 +102,9 @@ if [[ "${1:-}" == "--chunk" ]]; then
   # ssearch36 -m 8C columns:
   # $1 qseqid, $2 sseqid, $3 pident, $4 length,
   # $7 qstart, $8 qend, $9 sstart, $10 send, ...
-  ssearch36 -m 8C "$QFA" "$CHUNK_FASTA" \
+  # -T is required: ssearch36 otherwise starts one thread per core in EVERY
+  # parallel chunk job (13 jobs x 128 threads drove a shared node to load 699).
+  ssearch36 -T "${SSEARCH_THREADS:-4}" -m 8C "$QFA" "$CHUNK_FASTA" \
   | awk -v QLENFILE="$QLEN_TSV" -v MINID="$MIN_ID" -v MINCOV="$MIN_COV" -v HITSFILE="$CHUNK_HITS" '
       BEGIN{
         OFS="\t"
@@ -275,7 +282,9 @@ awk '
 ALL_HITS="$OUTDIR/all_hits.bed"
 : > "$ALL_HITS"
 
-export SEARCH_DB DB_SIZE QFA QLEN_TSV OUTDIR TOTAL_CHUNKS CHUNK_BP MIN_ID MIN_COV
+SSEARCH_THREADS="${SSEARCH_THREADS:-4}"
+log "ssearch36 threads per chunk: $SSEARCH_THREADS (x $MAX_CONCURRENT jobs)"
+export SEARCH_DB DB_SIZE QFA QLEN_TSV OUTDIR TOTAL_CHUNKS CHUNK_BP MIN_ID MIN_COV SSEARCH_THREADS
 
 SELF="$0"
 if command -v readlink >/dev/null 2>&1; then
@@ -286,7 +295,11 @@ fi
 [[ -n "${SELF_ABS:-}" ]] && SELF="$SELF_ABS"
 
 log "Launching parallel processing of $TOTAL_CHUNKS chunks (-j $MAX_CONCURRENT)"
-seq 1 "$TOTAL_CHUNKS" | parallel --eta --progress -j "$MAX_CONCURRENT" "$SELF" --chunk {}
+# GNU parallel buffers job output in its tmpdir; the default /tmp is often a small RAM
+# tmpfs or root partition and filled up on real runs. Use $TMPDIR, else ~/tmp.
+PAR_TMP="${TMPDIR:-$HOME/tmp}"
+mkdir -p "$PAR_TMP"
+seq 1 "$TOTAL_CHUNKS" | parallel --tmpdir "$PAR_TMP" --eta --progress -j "$MAX_CONCURRENT" "$SELF" --chunk {}
 
 log "All chunks completed. Collecting hits..."
 cat "$OUTDIR"/chunk_*.hits.bed > "$ALL_HITS" 2>/dev/null || true

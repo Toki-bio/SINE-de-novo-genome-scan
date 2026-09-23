@@ -126,6 +126,9 @@ for r in 5p mid 3p; do
       coords = substr(h, last_colon+1)
 
       gsub(/_sliding$/, "", id)
+      # mid-region fragments come from `seqkit subseq --bed`, which appends
+      # "_<start>-<end>:<strand>" to the ID; the true coordinates are rebuilt below
+      sub(/_[0-9]+-[0-9]+:[.+-]$/, "", id)
 
       dash_pos = index(coords, "-")
       if (dash_pos == 0) next
