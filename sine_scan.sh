@@ -19,6 +19,8 @@ set +m
 #
 # Env: MAX_CONCURRENT (parallel chunk jobs, default <= 8), SSEARCH_THREADS (threads per
 #   ssearch36 job, default 4), TMPDIR (GNU parallel buffers; default ~/tmp, never /tmp)
+# Optional orient QC (after merge, before getfasta): ORIENT_FILTER=1
+#   ORIENT_MIN_TRUE_ID=65 ORIENT_DELTA_REJECT=25 ORIENT_DELTA_PASS=30 ORIENT_KEEP_WEAK=1
 #
 # Outputs (in OUTDIR):
 #   all_hits.bed
@@ -382,8 +384,39 @@ bedtools slop -b "$FLANK" -g "$TARGET_GENOME.fai" -i "$TO_GENOME_HITS" \
 LOCI=$(wc -l < "$OUTDIR/merged_loci.bed" 2>/dev/null || echo 0)
 log "Summary: merged_loci=$LOCI"
 
+LOCI_BED="$OUTDIR/merged_loci.bed"
+if [[ "${ORIENT_FILTER:-0}" == "1" ]]; then
+  ORIENT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  ORIENT_PY="$ORIENT_DIR/orient_filter.py"
+  if [[ ! -f "$ORIENT_PY" ]]; then
+    echo "ERROR: ORIENT_FILTER=1 but missing $ORIENT_PY" >&2
+    exit 2
+  fi
+  for t in python3 mafft esl-alistat; do
+    command -v "$t" >/dev/null || { echo "ERROR: ORIENT_FILTER needs $t" >&2; exit 1; }
+  done
+  log "Orientation filter (MAFFT + esl-alistat)..."
+  python3 "$ORIENT_PY" \
+    --queries "$QFA" \
+    --genome "$TARGET_GENOME" \
+    --hits "$TO_GENOME_HITS" \
+    --loci "$LOCI_BED" \
+    --out-ok "$OUTDIR/merged_loci.orient_ok.bed" \
+    --out-fail "$OUTDIR/merged_loci.orient_fail.bed" \
+    --tsv "$OUTDIR/orient_filter.tsv" \
+    --min-true-id "${ORIENT_MIN_TRUE_ID:-65}" \
+    --delta-reject "${ORIENT_DELTA_REJECT:-25}" \
+    --delta-pass "${ORIENT_DELTA_PASS:-30}" \
+    ${ORIENT_KEEP_WEAK:+--keep-weak} \
+    --tmpdir "${TMPDIR:-$HOME/tmp}"
+  LOCI_OK=$(wc -l < "$OUTDIR/merged_loci.orient_ok.bed" 2>/dev/null || echo 0)
+  LOCI_FAIL=$(wc -l < "$OUTDIR/merged_loci.orient_fail.bed" 2>/dev/null || echo 0)
+  log "Orient filter: kept=$LOCI_OK rejected=$LOCI_FAIL (see orient_filter.tsv)"
+  LOCI_BED="$OUTDIR/merged_loci.orient_ok.bed"
+fi
+
 log "Extracting FASTA..."
-bedtools getfasta -fi "$TARGET_GENOME" -bed "$OUTDIR/merged_loci.bed" -s -name \
+bedtools getfasta -fi "$TARGET_GENOME" -bed "$LOCI_BED" -s -name \
 > "$OUTDIR/merged_loci.fa"
 
 awk '/^>/{h=substr($0,2); gsub(/\|/,"_",h); gsub(/:/,"_",h); print ">"h; next} {print}' \

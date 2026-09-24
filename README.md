@@ -138,11 +138,18 @@ Outputs:
 
 Run:
 ```bash
-bash sine_scan.sh \
-  -q SINEBase.nr95.fragments.nr85.fa \
-  -g genome.fa \
-  -o sine_search_out/genome_name
+bash sine_scan.sh genome.fa queries.fa
 ```
+
+Optional **orientation QC** after locus merge (MAFFT + `esl-alistat`, see
+`ORIENT_NOISE_FLOOR.md` in SINE_discriminator docs):
+
+```bash
+ORIENT_FILTER=1 ORIENT_KEEP_WEAK=1 ./sine_scan.sh genome.fa queries.fa
+```
+
+Writes `merged_loci.orient_ok.bed`, `merged_loci.orient_fail.bed`, `orient_filter.tsv`;
+`merged_loci.fa` is built from ok loci only. Requires `python3`, `mafft`, `esl-alistat`.
 
 ---
 
