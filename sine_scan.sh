@@ -161,10 +161,21 @@ if [[ "${1:-}" == "--chunk" ]]; then
 
         shift = interval_start0 + chunk_off1 - 1
 
-        # Subject coords inside CHUNK: allow reverse (sstart > send)
+        # Regular FASTA: the subject name is the samtools region "scf:start-end",
+        # whose start is 1-BASED (the minus-bank "()" form above is 0-based from
+        # bedtools getfasta). Treating it as 0-based put every hit 1 bp to the right.
+        if (n == 2 && p[2] ~ /^[0-9]+-[0-9]+$/) {
+          start1 = p[2]; sub(/-.*/, "", start1)
+          shift = start1 - 1
+        }
+
+        # Strand: ssearch36 (36.3.8) reports a reverse-complement match by REVERSING
+        # THE QUERY coordinates ($7 > $8) with the subject ascending, so testing the
+        # subject alone labelled every minus-strand hit "+". Minus = exactly one of the
+        # two coordinate pairs is descending.
         s1=$9+0; s2=$10+0
-        if (s1 <= s2) { ss=s1; ee=s2; strand="+" }
-        else          { ss=s2; ee=s1; strand="-" }
+        if (s1 <= s2) { ss=s1; ee=s2 } else { ss=s2; ee=s1 }
+        strand = (((s1 > s2) + ($7+0 > $8+0)) == 1) ? "-" : "+"
 
         # Convert to ORIGINAL scaffold BED coords (0-based, half-open)
         bed_start = shift + (ss - 1)
