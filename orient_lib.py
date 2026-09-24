@@ -67,7 +67,7 @@ def parse_aligned_fasta(text: str) -> dict[str, str]:
         elif line.strip():
             parts.append(line.strip())
     if name:
-        out[name] = "".join(parts)
+        out[name] = "".join(parts).upper()
     return out
 
 
