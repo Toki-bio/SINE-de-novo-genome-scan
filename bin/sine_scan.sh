@@ -38,6 +38,12 @@ CHUNK_BP="${CHUNK_BP:-100000000}"
 FLANK="${FLANK:-50}"
 MIN_ID="${MIN_ID:-65}"
 MIN_COV="${MIN_COV:-0.90}"
+# Raw Smith-Waterman score cutoff (replaces the E-value gate, 2026-11-19). Calibrated on 5 Mb of Ophiothrix fragilis
+# (OZ485154.1:30-35 Mb), dinucleotide-shuffled (esl-shuffle -d), scanned with the v2.2 bank of 1801 x 50 bp fragments:
+# chance hits fall about 10-fold per 14 raw points (36,775 hits >= any score, 56 >= 100, 3 >= 120, none >= 130 in 5 Mb);
+# extrapolated, 170 leaves < 1 expected chance hit in a 3.2 Gb genome. For a 50 bp fragment without gaps 170 means
+# >= 42/50 identical (84 %). Valid for ~50 bp fragments; recalibrate for other query lengths or much larger genomes.
+MIN_RAW="${MIN_RAW:-170}"
 
 # Do NOT default to nproc (steals the node). Cap by default.
 MAX_CONCURRENT_DEFAULT="$(nproc 2>/dev/null || echo 8)"
@@ -64,6 +70,7 @@ if [[ "${1:-}" == "--chunk" ]]; then
   : "${CHUNK_BP:?missing env CHUNK_BP}"
   : "${MIN_ID:?missing env MIN_ID}"
   : "${MIN_COV:?missing env MIN_COV}"
+  : "${MIN_RAW:?missing env MIN_RAW}"
 
   offset=$(( (chunk_i-1)*CHUNK_BP + 1 ))
   if (( offset > DB_SIZE )); then
@@ -101,13 +108,41 @@ if [[ "${1:-}" == "--chunk" ]]; then
   CHUNK_HITS="$OUTDIR/chunk_${chunk_i}.hits.bed"
   : > "$CHUNK_HITS"
 
-  # ssearch36 -m 8C columns:
+  # ssearch36 -m 8CB columns:
   # $1 qseqid, $2 sseqid, $3 pident, $4 length,
-  # $7 qstart, $8 qend, $9 sstart, $10 send, ...
+  # $7 qstart, $8 qend, $9 sstart, $10 send, $11 evalue, $12 bits, $13 BTOP
   # -T is required: ssearch36 otherwise starts one thread per core in EVERY
   # parallel chunk job (13 jobs x 128 threads drove a shared node to load 699).
-  ssearch36 -T "${SSEARCH_THREADS:-4}" -m 8C "$QFA" "$CHUNK_FASTA" \
-  | awk -v QLENFILE="$QLEN_TSV" -v MINID="$MIN_ID" -v MINCOV="$MIN_COV" -v HITSFILE="$CHUNK_HITS" '
+  #
+  # -E "1000000 1" (2026-11-18): no E-value gate. Without -E, ssearch36 (DNA) prints the best hit of each
+  # 150 kb library piece only at E < 2 and every further hit in that piece only at E < 0.001, and E (and
+  # ssearch36's bit score, zs_to_bit()) is scaled by the number of pieces in the chunk: the same alignment
+  # passed in a 2.5 Mb chunk and failed in a 20 Mb chunk (8001 vs 4044 hits on the same 20 Mb slice).
+  # Hits are now kept by raw Smith-Waterman score (>= MIN_RAW, calibrated on shuffled sequence, see CONFIG),
+  # identity and query coverage, all properties of the alignment alone; the raw score is column 7. It is computed from
+  # the BTOP with ssearch36's DNA scoring (+5/-4, a gap of k costs 12+4k) because the raw-score column
+  # (-m 8...r) exists only in fasta36 builds newer than 36.3.8e; tests/test_rawscore.sh checks it against
+  # ssearch36's own "Smith-Waterman score" lines.
+  ssearch36 -T "${SSEARCH_THREADS:-4}" -E "1000000 1" -m 8CB "$QFA" "$CHUNK_FASTA" \
+  | awk -v QLENFILE="$QLEN_TSV" -v MINID="$MIN_ID" -v MINCOV="$MIN_COV" -v MINRAW="$MIN_RAW" -v HITSFILE="$CHUNK_HITS" '
+      # raw SW score of a BTOP string: digits = run of identities, a letter pair = one aligned column
+      # (mismatch, or a gap column when one letter is "-"); consecutive gap columns on the same side = one gap
+      function rawscore(b,   s, i, c, num, a, d, side, prev) {
+        s = 0; num = ""; prev = ""
+        for (i = 1; i <= length(b); i++) {
+          c = substr(b, i, 1)
+          if (c ~ /[0-9]/) { num = num c; continue }
+          if (num != "") { s += 5 * num; num = ""; prev = "" }
+          a = c; d = substr(b, ++i, 1)
+          if (a == "-" || d == "-") {
+            side = (a == "-") ? "q" : "s"
+            s -= (side == prev) ? 4 : 16
+            prev = side
+          } else { s -= 4; prev = "" }
+        }
+        if (num != "") s += 5 * num
+        return s
+      }
       BEGIN{
         OFS="\t"
         while((getline < QLENFILE) > 0){
@@ -131,6 +166,8 @@ if [[ "${1:-}" == "--chunk" ]]; then
         ql = (q in qlen ? qlen[q] : 0)
         alen=$4+0
         if(ql>0 && (alen/ql) < MINCOV) next
+        raw = rawscore($13)
+        if(raw < MINRAW) next
 
         subj=$2
         split(subj,sa,/[ \t\r\n]+/); subj=sa[1]
@@ -189,7 +226,7 @@ if [[ "${1:-}" == "--chunk" ]]; then
         gsub(/\|/,"_",qsafe)
         gsub(/:/,"_",qsafe)
 
-        print scf, bed_start, bed_end, qsafe, $3, strand >> HITSFILE
+        print scf, bed_start, bed_end, qsafe, $3, strand, raw >> HITSFILE
       }
     '
 
@@ -264,7 +301,7 @@ log "Genome size : $DB_SIZE bp"
 log "Chunk size  : $CHUNK_BP bp"
 log "Total chunks: $TOTAL_CHUNKS"
 log "Parallel jobs: $MAX_CONCURRENT"
-log "MIN_ID=$MIN_ID  MIN_COV=$MIN_COV  FLANK=$FLANK"
+log "MIN_ID=$MIN_ID  MIN_COV=$MIN_COV  MIN_RAW=$MIN_RAW  FLANK=$FLANK"
 if (( DB_IS_MINUS == 1 )); then
   log "DB detected : minus-bank style headers"
 else
@@ -297,7 +334,7 @@ ALL_HITS="$OUTDIR/all_hits.bed"
 
 SSEARCH_THREADS="${SSEARCH_THREADS:-4}"
 log "ssearch36 threads per chunk: $SSEARCH_THREADS (x $MAX_CONCURRENT jobs)"
-export SEARCH_DB DB_SIZE QFA QLEN_TSV OUTDIR TOTAL_CHUNKS CHUNK_BP MIN_ID MIN_COV SSEARCH_THREADS
+export SEARCH_DB DB_SIZE QFA QLEN_TSV OUTDIR TOTAL_CHUNKS CHUNK_BP MIN_ID MIN_COV MIN_RAW SSEARCH_THREADS
 
 SELF="$0"
 if command -v readlink >/dev/null 2>&1; then
