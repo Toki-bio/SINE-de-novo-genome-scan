@@ -117,15 +117,9 @@ What the script does:
    - Parallelized at the query level
    - Each fragment is searched independently
    - Live progress reporting: `[QUERY 412/926] src=5S-Sauria region=5p 11–60 raw=42 filtered=3`
-3. Filtering (no E-value: ssearch36 runs with `-E "1000000 1"`, because its E-values and bit scores scale with the
-   chunk size, so the same alignment passed in a small chunk and failed in a large one)
-   - Raw Smith-Waterman score `MIN_RAW` (default 170), computed from the alignment (BTOP) and written as column 7 of
-     the hit BED. 170 leaves < 1 expected chance hit of a 50 bp fragment in a 3.2 Gb genome, calibrated on
-     dinucleotide-shuffled sequence (see the CONFIG comment in `sine_scan.sh`)
-   - Minimum identity `MIN_ID` (65)
-   - Minimum query coverage `MIN_COV` (0.90)
-   - Tests: `tests/test_rawscore.sh` (raw score equals ssearch36's own), `tests/test_chunk_independence.sh`
-     (same hits at any `CHUNK_BP`, no chance hits)
+3. Filtering
+   - Minimum identity
+   - Minimum query coverage
 4. Hit merging
    - All filtered hits merged into a single file
    - Converted to BED
